@@ -2,7 +2,7 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
-from omnilearned.network import PET2
+from omnilearned.network import MLPGEN
 from omnilearned.dataloader import load_data
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -12,56 +12,33 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from omnilearned.utils import (
     is_master_node,
     ddp_setup,
-    get_param_groups,
-    CLIPLoss,
     get_checkpoint_name,
     shadow_copy,
-    get_loss,
-    save_checkpoint,
-    restore_checkpoint,
-    get_model_parameters,
 )
+
+from omnilearned.diffusion import perturb_hl
 
 import time
 import os
-import torch.amp as amp
-
-torch.set_float32_matmul_precision("high")
-torch._dynamo.config.verbose = False
-
-
-def get_logs(device):
-    logs_buff = torch.zeros((5), dtype=torch.float32, device=device)
-    logs = {}
-    logs["loss"] = logs_buff[0].view(-1)
-    logs["loss_class"] = logs_buff[1].view(-1)
-    logs["loss_gen"] = logs_buff[2].view(-1)
-    logs["loss_clip"] = logs_buff[3].view(-1)
-    logs["loss_class_event"] = logs_buff[4].view(-1)
-    return logs
 
 
 def train_step(
     model,
     dataloader,
-    class_cost,
     gen_cost,
     optimizer,
     scheduler,
+    epoch,
     device,
-    clip_loss=CLIPLoss(),
-    use_clip=False,
-    use_event_loss=False,
     iterations_per_epoch=-1,
-    use_amp=False,
-    gscaler=None,
     ema_model=None,
     ema_decay=0.9999,
-    mode="classifier",
 ):
     model.train()
 
-    logs = get_logs(device)
+    logs_buff = torch.zeros((1), dtype=torch.float32, device=device)
+    logs = {}
+    logs["loss"] = logs_buff[0].view(-1)
 
     if iterations_per_epoch < 0:
         iterations_per_epoch = len(dataloader)
@@ -77,48 +54,19 @@ def train_step(
 
         # for batch_idx, batch in enumerate(dataloader):
         optimizer.zero_grad()  # Zero the gradients
+        X = batch["cond"].to(device, dtype=torch.float)
+        c = X[:, 1:2]
+        X = torch.cat((X[:, :1], X[:, 2:]), dim=1)
 
-        X, y = batch["X"].to(device, dtype=torch.float), batch["y"].to(device)
+        time = torch.rand(size=(X.shape[0],)).to(X.device)
+        z, v, _ = perturb_hl(X, time)
+        z_pred = model(z, time, c)
+        loss = gen_cost(v, z_pred).mean()
+        logs["loss"] += loss.detach()
 
-        model_kwargs = {
-            key: (batch[key].to(device) if batch[key] is not None else None)
-            for key in ["cond", "pid", "add_info"]
-            if key in batch
-        }
-
-        if batch.get("data_pid") is not None:
-            data_pid = batch["data_pid"].to(device)
-        else:
-            data_pid = None
-
-        with amp.autocast(
-            "cuda:{}".format(device) if torch.cuda.is_available() else "cpu",
-            enabled=use_amp,
-        ):
-            outputs = model(X, y, **model_kwargs)
-            loss = get_loss(
-                outputs,
-                y,
-                class_cost,
-                gen_cost,
-                use_event_loss,
-                use_clip,
-                clip_loss,
-                logs,
-                data_pid=data_pid,
-                mode=mode,
-            )
-
-        if use_amp and gscaler is not None:
-            gscaler.scale(loss).backward()
-            gscaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            gscaler.step(optimizer)
-            gscaler.update()
-        else:
-            loss.backward()  # Backward pass
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()  # Update parameters
+        loss.backward()  # Backward pass
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()  # Update parameters
         scheduler.step()
 
         if ema_model is not None:
@@ -139,23 +87,22 @@ def train_step(
 def val_step(
     model,
     dataloader,
-    class_cost,
     gen_cost,
+    epoch,
     device,
-    clip_loss=CLIPLoss(),
-    use_clip=False,
-    use_event_loss=False,
     iterations_per_epoch=-1,
-    mode="classifier",
 ):
     model.eval()
 
-    logs = get_logs(device)
+    logs_buff = torch.zeros((1), dtype=torch.float32, device=device)
+    logs = {}
+    logs["loss"] = logs_buff[0].view(-1)
 
     if iterations_per_epoch < 0:
         iterations_per_epoch = len(dataloader)
 
     data_iter = iter(dataloader)
+
     for batch_idx in range(iterations_per_epoch):
         try:
             batch = next(data_iter)
@@ -163,33 +110,18 @@ def val_step(
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        # for batch_idx, batch in enumerate(dataloader):
-        X, y = batch["X"].to(device, dtype=torch.float), batch["y"].to(device)
-        model_kwargs = {
-            key: (batch[key].to(device) if batch[key] is not None else None)
-            for key in ["cond", "pid", "add_info"]
-            if key in batch
-        }
+        X = batch["cond"].to(device, dtype=torch.float)
+        c = X[:, 1:2]
+        X = torch.cat((X[:, :1], X[:, 2:]), dim=1)
 
-        if batch.get("data_pid") is not None:
-            data_pid = batch["data_pid"].to(device)
-        else:
-            data_pid = None
+        time = torch.rand(size=(X.shape[0],)).to(X.device)
+        z, v, _ = perturb_hl(X, time)
 
         with torch.no_grad():
-            outputs = model(X, y, **model_kwargs)
-            get_loss(
-                outputs,
-                y,
-                class_cost,
-                gen_cost,
-                use_event_loss,
-                use_clip,
-                clip_loss,
-                logs,
-                data_pid=data_pid,
-                mode=mode,
-            )
+            z_pred = model(z, time, c)
+            loss = gen_cost(v, z_pred).mean()
+
+        logs["loss"] += loss.detach()
 
     if dist.is_initialized():
         for key in logs:
@@ -208,20 +140,15 @@ def train_model(
     num_epochs=1,
     device="cpu",
     patience=500,
-    loss_class=nn.CrossEntropyLoss(),
     loss_gen=nn.MSELoss(),
-    use_clip=False,
-    use_event_loss=False,
     output_dir="",
     save_tag="",
     iterations_per_epoch=-1,
     epoch_init=0,
     loss_init=np.inf,
-    use_amp=False,
     run=None,
     ema_model=None,
     ema_decay=0.999,
-    mode="classifier",
 ):
     checkpoint_name = get_checkpoint_name(save_tag)
 
@@ -231,10 +158,6 @@ def train_model(
     }
 
     tracker = {"bestValLoss": loss_init, "bestEpoch": epoch_init}
-    if use_amp:
-        gscaler = amp.GradScaler()
-    else:
-        gscaler = None
     for epoch in range(int(epoch_init), num_epochs):
         if isinstance(
             train_loader.sampler, torch.utils.data.distributed.DistributedSampler
@@ -245,30 +168,22 @@ def train_model(
         train_logs = train_step(
             model,
             train_loader,
-            loss_class,
             loss_gen,
             optimizer,
             lr_scheduler,
+            epoch,
             device,
-            use_clip=use_clip,
-            use_event_loss=use_event_loss,
             iterations_per_epoch=iterations_per_epoch,
-            use_amp=use_amp,
-            gscaler=gscaler,
             ema_model=ema_model,
             ema_decay=ema_decay,
-            mode=mode,
         )
         val_logs = val_step(
             model,
             val_loader,
-            loss_class,
             loss_gen,
+            epoch,
             device,
-            use_clip=use_clip,
-            use_event_loss=use_event_loss,
             iterations_per_epoch=iterations_per_epoch,
-            mode=mode,
         )
 
         losses["train_loss"].append(train_logs["loss"])
@@ -279,20 +194,6 @@ def train_model(
                 f"Epoch [{epoch + 1}/{num_epochs}] Loss: {losses['train_loss'][-1]:.4f}, Val Loss: {losses['val_loss'][-1]:.4f} , lr: {lr_scheduler.get_last_lr()[0]}"
             )
             print(
-                f"Class Loss: {train_logs['loss_class']:.4f}, Class Val Loss: {val_logs['loss_class']:.4f}"
-            )
-            if use_event_loss:
-                print(
-                    f"Class Event Loss: {train_logs['loss_class_event']:.4f}, Class Event Val Loss: {val_logs['loss_class_event']:.4f}"
-                )
-            print(
-                f"Gen Loss: {train_logs['loss_gen']:.4f}, Gen Val Loss: {val_logs['loss_gen']:.4f}"
-            )
-            if use_clip:
-                print(
-                    f"CLIP loss: {train_logs['loss_clip']:.4f}, CLIP Val Loss: {val_logs['loss_clip']:.4f}"
-                )
-            print(
                 "Time taken for epoch {} is {} sec".format(epoch, time.time() - start)
             )
 
@@ -300,18 +201,18 @@ def train_model(
             tracker["bestValLoss"] = losses["val_loss"][-1]
             tracker["bestEpoch"] = epoch
 
-        if is_master_node():
-            print("replacing best checkpoint ...")
-            save_checkpoint(
-                model,
-                ema_model,
-                epoch + 1,
-                optimizer,
-                losses["val_loss"][-1],
-                lr_scheduler,
-                output_dir,
-                checkpoint_name,
-            )
+            if is_master_node():
+                print("replacing best checkpoint ...")
+                save_checkpoint(
+                    model,
+                    ema_model,
+                    epoch + 1,
+                    optimizer,
+                    losses["val_loss"][-1],
+                    lr_scheduler,
+                    output_dir,
+                    checkpoint_name,
+                )
 
         if run is not None:
             for key in train_logs:
@@ -331,70 +232,104 @@ def train_model(
         json.dump(losses, open(f"{output_dir}/training_{save_tag}.json", "w"))
 
 
+def save_checkpoint(
+    model,
+    ema_model,
+    epoch,
+    optimizer,
+    loss,
+    lr_scheduler,
+    checkpoint_dir,
+    checkpoint_name,
+):
+    save_dict = {
+        "model": model.module.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "loss": loss,
+        "sched": lr_scheduler.state_dict(),
+    }
+
+    if ema_model is not None:
+        save_dict["ema_model"] = ema_model.state_dict()
+
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    torch.save(save_dict, os.path.join(checkpoint_dir, checkpoint_name))
+    print(
+        f"Epoch {epoch} | Training checkpoint saved at {os.path.join(checkpoint_dir, checkpoint_name)}"
+    )
+
+
+def restore_checkpoint(
+    model,
+    optimizer,
+    lr_scheduler,
+    checkpoint_dir,
+    checkpoint_name,
+    device,
+    ema_model=None,
+    is_main_node=False,
+):
+    device = "cuda:{}".format(device) if torch.cuda.is_available() else "cpu"
+    checkpoint = torch.load(
+        os.path.join(checkpoint_dir, checkpoint_name),
+        map_location=device,
+    )
+
+    base_model = model
+    base_model.to(device)
+
+    base_model.load_state_dict(checkpoint["model"], strict=True)
+    lr_scheduler.load_state_dict(checkpoint["sched"])
+    startEpoch = checkpoint["epoch"] + 1
+    best_loss = checkpoint["loss"]
+
+    if ema_model is not None:
+        if "ema_model" in checkpoint:
+            ema_model.load_state_dict(checkpoint["ema_model"], strict=True)
+
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    except Exception:
+        if is_main_node:
+            print("Optimizer cannot be loaded back, skipping...")
+
+    return startEpoch, best_loss
+
+
 def run(
     outdir: str = "",
     save_tag: str = "",
-    pretrain_tag: str = "pretrain",
     dataset: str = "top",
     path: str = "/pscratch/sd/v/vmikuni/datasets",
     wandb=False,
-    fine_tune: bool = False,
     resuming: bool = False,
-    num_feat: int = 4,
-    model_size: str = "small",
-    interaction: bool = False,
+    num_feat: int = 3,
     conditional: bool = False,
-    num_cond: bool = 3,
-    use_pid: bool = False,
-    pid_idx: int = -1,
-    pid_dim: int = 9,
-    use_add: bool = False,
-    num_add: int = 4,
-    zero_add: bool = False,
-    use_clip: bool = False,
-    use_event_loss: bool = False,
-    num_classes: int = 2,
-    num_gen_classes: int = 1,
-    mode: str = "classifier",
+    num_cond: bool = 1,
     batch: int = 64,
     iterations: int = -1,
     epoch: int = 15,
     warmup_epoch: int = 1,
-    use_amp: bool = False,
     optim: str = "lion",
-    sched: str = "cosine",
     b1: float = 0.95,
     b2: float = 0.98,
     lr: float = 5e-4,
-    lr_factor: float = 10.0,
     wd: float = 0.3,
-    attn_drop: float = 0.1,
     mlp_drop: float = 0.1,
-    feature_drop: float = 0.0,
     num_workers: int = 16,
-    clip_inputs: bool = False,
 ):
     local_rank, rank, size = ddp_setup()
 
-    model_params = get_model_parameters(model_size)
-
     # set up model
-    model = PET2(
+    model = MLPGEN(
         input_dim=num_feat,
-        use_int=interaction,
+        hidden_size=256,
+        mlp_drop=mlp_drop,
         conditional=conditional,
         cond_dim=num_cond,
-        pid=use_pid,
-        pid_dim=pid_dim,
-        add_info=use_add,
-        add_dim=num_add,
-        mode=mode,
-        num_classes=num_classes,
-        num_gen_classes=num_gen_classes,
-        mlp_drop=mlp_drop,
-        attn_drop=attn_drop,
-        feature_drop=feature_drop,
-        **model_params,
     )
 
     if rank == 0:
@@ -412,18 +347,11 @@ def run(
         dataset,
         dataset_type="train",
         use_cond=conditional,
-        use_pid=use_pid,
-        pid_idx=pid_idx,
-        use_add=use_add,
-        num_add=num_add,
         path=path,
         batch=batch,
         num_workers=num_workers,
         rank=rank,
         size=size,
-        clip_inputs=clip_inputs,
-        ftag=mode == "ftag",
-        mode=mode,
     )
     if rank == 0:
         print("**** Setup ****")
@@ -434,53 +362,32 @@ def run(
         dataset,
         dataset_type="val",
         use_cond=conditional,
-        use_pid=use_pid,
-        pid_idx=pid_idx,
-        use_add=use_add,
-        num_add=num_add,
         path=path,
         batch=batch,
         num_workers=num_workers,
         rank=rank,
         size=size,
-        clip_inputs=clip_inputs,
-        ftag=mode == "ftag",
-        mode=mode
     )
 
-    param_groups = get_param_groups(
-        model, wd, lr, lr_factor=lr_factor, fine_tune=fine_tune
-    )
+    param_groups = model.parameters()
 
     if optim not in ["adam", "lion"]:
         raise ValueError(
             f"Optimizer '{optim}' not supported. Choose from adam or lion."
         )
-    if sched not in ["cosine", "onecycle"]:
-        raise ValueError(
-            f"Scheduler '{sched}' not supported. Choose from cosine or onecycle."
-        )
 
     if optim == "lion":
-        optimizer = Lion(param_groups, betas=(b1, b2))
-    elif optim == "adam":
-        optimizer = torch.optim.AdamW(param_groups)
+        optimizer = Lion(param_groups, lr=lr, betas=(b1, b2))
+    if optim == "adam":
+        optimizer = torch.optim.AdamW(param_groups, lr=lr)
 
     train_steps = len(train_loader) if iterations < 0 else iterations
 
-    if sched == "onecycle":
-        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer=optimizer,
-            total_steps=(train_steps * epoch),
-            max_lr=lr,
-            pct_start=0.1,
-        )
-    elif sched == "cosine":
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=train_steps * warmup_epoch,
-            num_training_steps=(train_steps * epoch),
-        )
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=train_steps * warmup_epoch,
+        num_training_steps=(train_steps * epoch),
+    )
 
     # Transfer model to GPU if available
     kwarg = {}
@@ -502,34 +409,22 @@ def run(
 
     epoch_init = 0
     loss_init = np.inf
-    checkpoint_name = None
 
     if os.path.isfile(os.path.join(outdir, get_checkpoint_name(save_tag))) and resuming:
         if is_master_node():
             print(
                 f"Continue training with checkpoint from {os.path.join(outdir, get_checkpoint_name(save_tag))}"
             )
-        checkpoint_name = get_checkpoint_name(save_tag)
-        fine_tune = False
 
-    elif fine_tune:
-        if is_master_node():
-            print(
-                f"Will fine-tune using checkpoint {os.path.join(outdir, get_checkpoint_name(pretrain_tag))}"
-            )
-        checkpoint_name = get_checkpoint_name(pretrain_tag)
-
-    if checkpoint_name is not None:
         epoch_init, loss_init = restore_checkpoint(
             model,
+            optimizer,
+            lr_scheduler,
             outdir,
-            checkpoint_name,
+            get_checkpoint_name(save_tag),
             local_rank,
-            is_main_node=is_master_node(),
             ema_model=ema_model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            fine_tune=fine_tune,
+            is_main_node=is_master_node(),
         )
 
     if wandb:
@@ -551,7 +446,6 @@ def run(
                 "learning_rate": lr,
                 "epochs": epoch,
                 "batch size": batch,
-                "mode": mode,
             },
         )
     else:
@@ -565,21 +459,14 @@ def run(
         lr_scheduler,
         num_epochs=epoch,
         device=device,
-        loss_class=nn.CrossEntropyLoss(reduction="none"),
-        loss_gen=nn.MSELoss(reduction="none")
-        if mode != "ftag"
-        else nn.CrossEntropyLoss(reduction="none"),
+        loss_gen=nn.MSELoss(),
         output_dir=outdir,
         save_tag=save_tag,
-        use_clip=use_clip,
-        use_event_loss=use_event_loss,
         iterations_per_epoch=iterations,
         epoch_init=epoch_init,
         loss_init=loss_init,
-        use_amp=use_amp,
         run=run,
         ema_model=ema_model,
-        mode=mode
     )
 
     dist.destroy_process_group()
