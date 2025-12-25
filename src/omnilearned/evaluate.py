@@ -33,7 +33,7 @@ def eval_model(
     rank=0,
 ):
     prediction, cond, labels = test_step(model, test_loader, mode, device)
-    if mode == "classifier" or mode == "regressor":
+    if mode == "classifier":
         if use_event_loss:
             np.savez(
                 os.path.join(outdir, f"outputs_{save_tag}_{dataset}_{rank}.npz"),
@@ -47,6 +47,22 @@ def eval_model(
                 os.path.join(outdir, f"outputs_{save_tag}_{dataset}_{rank}.npz"),
                 prediction=prediction.softmax(-1).cpu().numpy(),
                 pid=labels.cpu().numpy(),
+                cond=cond.cpu().numpy() if cond is not None else [],
+            )
+    elif mode == "regressor":
+        if use_event_loss:
+            np.savez(
+                os.path.join(outdir, f"outputs_{save_tag}_{dataset}_{rank}.npz"),
+                prediction=prediction[:, :200].cpu().numpy(),
+                event_prediction=prediction[:, 200:].cpu().numpy(),
+                reg=labels.cpu().numpy(),
+                cond=cond.cpu().numpy() if cond is not None else [],
+            )
+        else:
+            np.savez(
+                os.path.join(outdir, f"outputs_{save_tag}_{dataset}_{rank}.npz"),
+                prediction=prediction.cpu().numpy(),
+                reg=labels.cpu().numpy(),
                 cond=cond.cpu().numpy() if cond is not None else [],
             )
     else:
