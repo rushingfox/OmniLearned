@@ -234,7 +234,13 @@ def get_loss(
     
             loss = loss + loss_class
         elif mode == "regressor":
-            loss_reg = F.mse_loss(outputs["y_pred"], y)
+            #print(f"y_pred shape: {outputs['y_pred']. shape}")
+            #print(f"y shape: {y.shape}")
+            #print(f"y_pred sample: {outputs['y_pred'][:3]}")
+            #print(f"y sample: {y[:3]}")
+            
+            loss_reg = F. mse_loss(outputs["y_pred"], y)
+            #print(f"loss_reg: {loss_reg}")
             loss = loss + loss_reg
             
     if outputs["z_pred"] is not None:
@@ -405,6 +411,15 @@ def restore_checkpoint(
                 is_main_node,
             )
             base_model.classifier.load_state_dict(filtered_state, strict=False)
+
+        # Load classifier weights to the regressor also
+        if base_model.regressor is not None and "classifier_head" in checkpoint:
+            filtered_state = filter_partial_model(
+                checkpoint["classifier_head"],
+                base_model.regressor.state_dict(),
+                is_main_node,
+            )
+            base_model.regressor.load_state_dict(filtered_state, strict=False)
 
         if base_model.generator is not None:
             filtered_state = filter_partial_model(
